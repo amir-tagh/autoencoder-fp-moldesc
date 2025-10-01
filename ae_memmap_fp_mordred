@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+import os, json, math, argparse, time, warnings
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+from joblib import Parallel, delayed
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import IterableDataset, DataLoader
+
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem, DataStructs
+
+from mordred import Calculator, descriptors as mordred_descriptors
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+import joblib
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+RDLogger.DisableLog('rdApp.*')
+torch.use_deterministic_algorithms(False)
+
+# ------------------------- Utils -------------------------
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def count_rows_csv(path, has_header=True):
+    with open(path, 'rb') as f:
+        n = sum(1 for _ in f)
+    return max(0, n - (1 if has_header else 0))
+
+def set_num_threads(n):
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["MKL_NUM_THREADS"] = str(n)
+    torch.set_num_threads(n)
+
+def chunk_iter_csv(path, chunksize):
+    return pd.read_csv(path, chunksize=chunksize)
+
+# ------------------------- Fingerprints -------------------------
+def fp_row(sm, radius, nbits):
+    m = Chem.MolFromSmiles(sm)
+    if m is None:
+        return np.zeros((nbits,), dtype=np.uint8)
+    bv = AllChem.GetMorganFingerprintAsBitVect(m, radius, nBits=nbits)
+    arr = np.zeros((nbits,), dtype=np.uint8)
+    DataStructs.ConvertToNumpyArray(bv, arr)
+    return arr
+
+def build_fp_memmap(input_csv, out_path, nbits=2048, radius=2, chunksize=200_000, ncpus=32, total_rows=None):
+    if total_rows is None:
+        total_rows = count_rows_csv(input_csv, has_header=True)
+    mm = np.memmap(out_path, mode='w+', dtype='uint8', shape=(total_rows, nbits))
+    write = 0
+    pbar = tqdm(desc="FP memmap build", unit="rows")
+    for df in chunk_iter_csv(input_csv, chunksize):
+        smiles = df["SMILES"].astype(str).tolist()
+        rows = Parallel(n_jobs=ncpus, prefer="threads", batch_size=2000)(
+            delayed(fp_row)(s, radius, nbits) for s in smiles
+        )
+        block = np.asarray(rows, dtype=np.uint8)
+        mm[write:write+len(block)] = block
+        write += len(block)
+        pbar.update(len(block))
+    pbar.close()
+    mm.flush()
+    if write != total_rows:
+        raise RuntimeError(f"Row count mismatch: wrote {write}, expected {total_rows}")
+    return total_rows
+
+# ------------------------- Mordred descriptors -------------------------
+def calc_mordred_df(smiles_list, nproc=1):
+    """
+    Compute Mordred (2D) descriptors for a list of SMILES.
+    Returns a DataFrame; numeric columns only (coerce non-numeric to NaN).
+    """
+    calc = Calculator(mordred_descriptors, ignore_3D=True)
+    mols = [Chem.MolFromSmiles(s) for s in smiles_list]
+    try:
+        df = calc.pandas(mols, nproc=max(1, int(nproc)))
+    except TypeError:
+        df = calc.pandas(mols)  # Mordred version without nproc arg
+    df = df.apply(pd.to_numeric, errors="coerce")
+    # Flatten possible MultiIndex columns and cast to str
+    df.columns = [str(c) for c in df.columns]
+    return df
+
+def mordred_stats_passA(input_csv, chunksize=100_000, ncpus=32):
+    """
+    Stream once: compute NaN-aware per-column (count, sum, sumsq) + canonical column order.
+    Drops columns that are all-NaN at the very end (via 'keep' mask).
+    """
+    col_names = None
+    count = None
+    ssum = None
+    ssum2 = None
+
+    pbar = tqdm(desc="Mordred stats (pass A)", unit="rows")
+    for df in chunk_iter_csv(input_csv, chunksize):
+        smiles = df["SMILES"].astype(str).tolist()
+        dfx = calc_mordred_df(smiles, nproc=ncpus)
+
+        if col_names is None:
+            col_names = list(dfx.columns)
+            D = len(col_names)
+            count = np.zeros((D,), dtype=np.int64)
+            ssum  = np.zeros((D,), dtype=np.float64)
+            ssum2 = np.zeros((D,), dtype=np.float64)
+        else:
+            # Reindex to the canonical set (missing -> NaN)
+            dfx = dfx.reindex(columns=col_names)
+
+        X = dfx.values.astype(np.float64, copy=False)
+        valid = np.isfinite(X)
+        cnt = valid.sum(axis=0).astype(np.int64)
+        X0 = np.where(valid, X, 0.0)  # zero out NaNs for sums
+        count += cnt
+        ssum  += X0.sum(axis=0, dtype=np.float64)
+        ssum2 += (X0 * X0).sum(axis=0, dtype=np.float64)
+
+        pbar.update(len(dfx))
+    pbar.close()
+
+    if col_names is None:
+        raise RuntimeError("No data found / SMILES column missing?")
+
+    mean = np.zeros_like(ssum)
+    std  = np.ones_like(ssum)
+    nz = count > 0
+    mean[nz] = ssum[nz] / count[nz]
+    var = np.zeros_like(ssum)
+    var[nz] = ssum2[nz] / count[nz] - mean[nz] ** 2
+    var[var < 1e-12] = 1e-12
+    std[nz] = np.sqrt(var[nz])
+
+    keep = nz  # keep columns that had at least one finite value
+    kept_names = [col_names[i] for i in range(len(col_names)) if keep[i]]
+
+    return {
+        "names_all": np.array(col_names, dtype=object),
+        "keep_mask": keep.astype(np.bool_),
+        "names_keep": np.array(kept_names, dtype=object),
+        "mean_all": mean,
+        "std_all": std,
+        "count_all": count
+    }
+
+def build_mordred_memmap(input_csv, out_path, stats_npz, chunksize=100_000, ncpus=32):
+    """
+    Pass B: build standardized Mordred memmap (float32) using stats from pass A.
+    Drops columns with keep_mask==False.
+    """
+    Z = np.load(stats_npz, allow_pickle=True)
+    names_all = list(Z["names_all"])
+    keep_mask = Z["keep_mask"].astype(bool)
+    mean_all = Z["mean_all"].astype(np.float64)
+    std_all  = Z["std_all"].astype(np.float64)
+
+    names_keep = [names_all[i] for i in range(len(names_all)) if keep_mask[i]]
+    mean_keep = mean_all[keep_mask]
+    std_keep  = std_all[keep_mask]
+    std_keep[std_keep < 1e-12] = 1e-12
+
+    total_rows = count_rows_csv(input_csv, has_header=True)
+    D_keep = len(names_keep)
+    mm = np.memmap(out_path, mode='w+', dtype='float32', shape=(total_rows, D_keep))
+
+    write = 0
+    pbar = tqdm(desc="Mordred memmap build (pass B)", unit="rows")
+    for df in chunk_iter_csv(input_csv, chunksize):
+        smiles = df["SMILES"].astype(str).tolist()
+        dfx = calc_mordred_df(smiles, nproc=ncpus)
+        # Reindex and pick kept
+        dfx = dfx.reindex(columns=names_all)
+        X = dfx.values.astype(np.float64, copy=False)[:, keep_mask]
+
+        # Impute by mean, then standardize
+        X = np.where(np.isfinite(X), X, mean_keep[None, :])
+        X = (X - mean_keep[None, :]) / std_keep[None, :]
+
+        mm[write:write+len(X)] = X.astype(np.float32, copy=False)
+        write += len(X)
+        pbar.update(len(X))
+    pbar.close()
+    mm.flush()
+
+    if write != total_rows:
+        raise RuntimeError(f"Row count mismatch: wrote {write}, expected {total_rows}")
+
+    # Save a compact stats file alongside the memmap (kept only)
+    base = os.path.splitext(out_path)[0]
+    np.savez(base + "_kept_stats.npz",
+             names=np.array(names_keep, dtype=object),
+             mean=mean_keep, std=std_keep)
+
+    return total_rows, names_keep, mean_keep, std_keep
+
+# ------------------------- Dataset (chunk-shuffled) -------------------------
+class ConcatMemmapIterable(IterableDataset):
+    """
+    Concatenate FP (uint8) and Mordred (float32 standardized) memmaps on the fly.
+    Iterate blocks (chunk_rows) in random order; within each block, draw random batches.
+    Shards blocks across workers.
+    """
+    def __init__(self, fp_path, mordred_path, nrows, fp_bits, mordred_dim,
+                 chunk_rows=100_000, batch_size=4096, seed=42):
+        super().__init__()
+        self.fp_path = fp_path
+        self.mordred_path = mordred_path
+        self.nrows = nrows
+        self.fp_bits = fp_bits
+        self.mordred_dim = mordred_dim
+        self.chunk_rows = chunk_rows
+        self.batch_size = batch_size
+        self.seed = seed
+
+    def __iter__(self):
+        worker = torch.utils.data.get_worker_info()
+        wid, wnum = (worker.id, worker.num_workers) if worker else (0, 1)
+
+        Xfp = np.memmap(self.fp_path, mode='r', dtype='uint8', shape=(self.nrows, self.fp_bits))
+        Xmord = np.memmap(self.mordred_path, mode='r', dtype='float32', shape=(self.nrows, self.mordred_dim))
+
+        starts = list(range(0, self.nrows, self.chunk_rows))
+        rng = np.random.default_rng(self.seed + wid)
+        rng.shuffle(starts)
+        starts = starts[wid::wnum]
+
+        for s in starts:
+            e = min(s + self.chunk_rows, self.nrows)
+            block_fp = Xfp[s:e].astype(np.float32, copy=False)
+            block_md = Xmord[s:e]  # float32 standardized
+            idx = rng.permutation(e - s)
+            for i in range(0, len(idx), self.batch_size):
+                sel = idx[i:i+self.batch_size]
+                xb = np.concatenate([block_fp[sel], block_md[sel]], axis=1)
+                yield torch.from_numpy(xb)
+
+# ------------------------- Model -------------------------
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, input_dim)
+        )
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z), z
+
+# ------------------------- Training -------------------------
+def train_from_memmaps(
+    fp_memmap, mordred_memmap, nrows, fp_bits, mordred_dim,
+    outdir, latent_dim=128, epochs=20, batch_size=4096, ncpus=32,
+    chunk_rows=100_000, num_workers=8, val_sample=100_000
+):
+    device = torch.device("cpu")
+    set_num_threads(ncpus)
+
+    input_dim = fp_bits + mordred_dim
+    model = Autoencoder(input_dim=input_dim, latent_dim=latent_dim).to(device)
+    opt = optim.Adam(model.parameters(), lr=1e-3)
+    crit = nn.MSELoss()
+
+    ds = ConcatMemmapIterable(fp_memmap, mordred_memmap, nrows, fp_bits, mordred_dim,
+                              chunk_rows=chunk_rows, batch_size=batch_size)
+    dl = DataLoader(ds, batch_size=None, num_workers=num_workers, persistent_workers=(num_workers > 0),
+                    prefetch_factor=2)
+
+    # Validation sample (fixed)
+    rng = np.random.default_rng(42)
+    vsz = min(val_sample, nrows)
+    vidx = np.sort(rng.choice(nrows, size=vsz, replace=False))
+    Xfp_v = np.memmap(fp_memmap, mode='r', dtype='uint8', shape=(nrows, fp_bits))[vidx].astype(np.float32)
+    Xmd_v = np.memmap(mordred_memmap, mode='r', dtype='float32', shape=(nrows, mordred_dim))[vidx]
+    Xval = torch.from_numpy(np.concatenate([Xfp_v, Xmd_v], axis=1))
+    dl_val = DataLoader(torch.utils.data.TensorDataset(Xval), batch_size=batch_size, shuffle=False,
+                        num_workers=min(num_workers, 4))
+
+    tr_hist, va_hist = [], []
+    print(f"[Train] input_dim={input_dim} latent_dim={latent_dim} nrows={nrows} md_dim={mordred_dim}")
+
+    for ep in range(epochs):
+        t0 = time.time()
+        model.train()
+        s, n = 0.0, 0
+        with tqdm(desc=f"Epoch {ep+1}/{epochs} [train]", unit="batch") as p:
+            for xb in dl:
+                xb = xb.to(device)
+                opt.zero_grad()
+                out, _ = model(xb)
+                loss = crit(out, xb)
+                loss.backward(); opt.step()
+                s += loss.item() * xb.size(0)
+                n += xb.size(0)
+                p.update(1)
+        tr = s / max(1, n)
+        tr_hist.append(tr)
+
+        # Validation
+        model.eval()
+        s = 0.0
+        with torch.no_grad(), tqdm(total=len(dl_val), desc=f"Epoch {ep+1}/{epochs} [val]", unit="batch") as p:
+            for (xb,) in dl_val:
+                xb = xb.to(device)
+                out, _ = model(xb)
+                s += crit(out, xb).item() * xb.size(0)
+                p.update(1)
+        va = s / len(Xval)
+        va_hist.append(va)
+
+        print(f"[Epoch {ep+1}] train={tr:.6f}  val={va:.6f}  time={time.time()-t0:.1f}s")
+        # Plot + CSV
+        plt.figure()
+        plt.plot(tr_hist, label="train")
+        plt.plot(va_hist, label="val")
+        plt.xlabel("Epoch"); plt.ylabel("MSE")
+        plt.legend(); plt.title("Autoencoder Training Loss")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "training_loss_plot.png")); plt.close()
+        pd.DataFrame({"epoch": np.arange(1, len(tr_hist)+1),
+                      "train_loss": tr_hist, "val_loss": va_hist}).to_csv(
+            os.path.join(outdir, "training_metrics.csv"), index=False
+        )
+
+    torch.save(model.state_dict(), os.path.join(outdir, "autoencoder_model.pt"))
+    return model, tr_hist, va_hist
+
+# ------------------------- Artifacts -------------------------
+def save_artifacts(outdir, fp_bits, mordred_names, desc_mean, desc_std, latent_dim, fp_radius):
+    ensure_dir(outdir)
+    feature_names = [f"fp_{i}" for i in range(fp_bits)] + list(mordred_names)
+    with open(os.path.join(outdir, "feature_names.json"), "w") as f:
+        json.dump(feature_names, f)
+
+    meta = {
+        "input_dim": int(fp_bits + len(mordred_names)),
+        "latent_dim": int(latent_dim),
+        "fp_bits": int(fp_bits),
+        "fp_radius": int(fp_radius),
+        "used_descriptors": True,
+        "descriptor_kind": "mordred",
+        "desc_dim": int(len(mordred_names))
+    }
+    with open(os.path.join(outdir, "preproc.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Imputer: FP -> const 0; Mordred -> mean
+    total_dim = meta["input_dim"]
+    fp_cols   = list(range(fp_bits))
+    md_cols   = list(range(fp_bits, total_dim))
+    imputer = ColumnTransformer([
+        ("fp_imputer", SimpleImputer(strategy="constant", fill_value=0), fp_cols),
+        ("md_imputer", SimpleImputer(strategy="mean"), md_cols),
+    ], remainder="drop")
+
+    # Fit imputer on a tiny synthetic matrix whose md columns equal the target means
+    row = np.zeros((1, total_dim), dtype=np.float32)
+    row[0, fp_cols] = 0.0
+    row[0, md_cols] = desc_mean.astype(np.float32)
+    imputer.fit(np.vstack([row, row]))
+    joblib.dump(imputer, os.path.join(outdir, "imputer.pkl"))
+
+    # Scaler: FP -> identity; Mordred -> StandardScaler seeded with corpus stats
+    fp_scaler = StandardScaler(with_mean=False, with_std=False)
+    fp_scaler.fit(np.zeros((2, len(fp_cols)), dtype=np.float32))
+    md_scaler = StandardScaler()
+    md_scaler.fit(np.zeros((2, len(md_cols)), dtype=np.float32))
+    md_scaler.mean_ = desc_mean.astype(np.float64)
+    md_scaler.scale_ = np.where(desc_std > 0, desc_std, 1.0).astype(np.float64)
+    md_scaler.var_ = (md_scaler.scale_ ** 2).astype(np.float64)
+    md_scaler.n_features_in_ = len(md_cols)
+
+    scaler = ColumnTransformer([
+        ("fp_scale", fp_scaler, fp_cols),
+        ("md_scale", md_scaler, md_cols),
+    ], remainder="drop")
+
+    joblib.dump(scaler, os.path.join(outdir, "scaler.pkl"))
+
+# ------------------------- CLI -------------------------
+def main():
+    ap = argparse.ArgumentParser(description="FP + full-corpus Mordred via memmap, with chunk-shuffled AE training")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    # build-fp
+    ap_fp = sub.add_parser("build-fp", help="Build Morgan FP memmap (uint8)")
+    ap_fp.add_argument("--input", required=True)
+    ap_fp.add_argument("--out", required=True)
+    ap_fp.add_argument("--fp_bits", type=int, default=2048)
+    ap_fp.add_argument("--fp_radius", type=int, default=2)
+    ap_fp.add_argument("--chunksize", type=int, default=200_000)
+    ap_fp.add_argument("--ncpus", type=int, default=os.cpu_count() or 1)
+    ap_fp.add_argument("--rows", type=int, default=None)
+
+    # build-mordred (two-pass)
+    ap_md = sub.add_parser("build-mordred", help="Build Mordred memmap (float32) via two-pass stats")
+    ap_md.add_argument("--input", required=True)
+    ap_md.add_argument("--out", required=True)
+    ap_md.add_argument("--stats_npz", required=True)
+    ap_md.add_argument("--chunksize", type=int, default=100_000)
+    ap_md.add_argument("--ncpus", type=int, default=os.cpu_count() or 1)
+    ap_md.add_argument("--passA_only", action="store_true")
+
+    # train
+    ap_tr = sub.add_parser("train", help="Train AE from FP + Mordred memmaps")
+    ap_tr.add_argument("--fp_memmap", required=True)
+    ap_tr.add_argument("--mordred_memmap", required=True)
+    ap_tr.add_argument("--nrows", type=int, required=True)
+    ap_tr.add_argument("--fp_bits", type=int, default=2048)
+    ap_tr.add_argument("--fp_radius", type=int, default=2)
+    ap_tr.add_argument("--outdir", required=True)
+    ap_tr.add_argument("--latent_dim", type=int, default=128)
+    ap_tr.add_argument("--epochs", type=int, default=20)
+    ap_tr.add_argument("--batch_size", type=int, default=4096)
+    ap_tr.add_argument("--chunk_rows", type=int, default=100_000)
+    ap_tr.add_argument("--num_workers", type=int, default=8)
+    ap_tr.add_argument("--ncpus", type=int, default=os.cpu_count() or 1)
+
+    args = ap.parse_args()
+
+    if args.cmd == "build-fp":
+        ensure_dir(os.path.dirname(args.out) or ".")
+        t0 = time.time()
+        total = build_fp_memmap(
+            input_csv=args.input, out_path=args.out,
+            nbits=args.fp_bits, radius=args.fp_radius,
+            chunksize=args.chunksize, ncpus=args.ncpus, total_rows=args.rows
+        )
+        print(f"[build-fp] Done. nrows={total}. -> {args.out}  ({time.time()-t0:.1f}s)")
+        with open(args.out + ".meta.json", "w") as f:
+            json.dump({"nrows": total, "fp_bits": args.fp_bits, "fp_radius": args.fp_radius}, f, indent=2)
+
+    elif args.cmd == "build-mordred":
+        ensure_dir(os.path.dirname(args.out) or ".")
+        ensure_dir(os.path.dirname(args.stats_npz) or ".")
+        if args.passA_only:
+            stats = mordred_stats_passA(args.input, chunksize=args.chunksize, ncpus=args.ncpus)
+            np.savez(args.stats_npz, **stats)
+            print(f"[build-mordred] Pass A only: wrote stats -> {args.stats_npz}")
+        else:
+            if not os.path.exists(args.stats_npz):
+                stats = mordred_stats_passA(args.input, chunksize=args.chunksize, ncpus=args.ncpus)
+                np.savez(args.stats_npz, **stats)
+            total, names_keep, mean_keep, std_keep = build_mordred_memmap(
+                args.input, args.out, args.stats_npz, chunksize=args.chunksize, ncpus=args.ncpus
+            )
+            # also write compact stats next to memmap
+            base = os.path.splitext(args.out)[0]
+            np.savez(base + "_kept_stats.npz", names=np.array(names_keep, dtype=object),
+                     mean=mean_keep, std=std_keep)
+            print(f"[build-mordred] Done. nrows={total}. -> {args.out}")
+
+            with open(args.out + ".meta.json", "w") as f:
+                json.dump({"nrows": total, "mordred_dim": int(len(names_keep))}, f, indent=2)
+
+    elif args.cmd == "train":
+        ensure_dir(args.outdir)
+        # load compact stats for artifacts
+        base = os.path.splitext(args.mordred_memmap)[0]
+        kept_stats = base + "_kept_stats.npz"
+        if not os.path.exists(kept_stats):
+            # fall back to any .npz in same dir
+            candidates = [os.path.join(os.path.dirname(args.mordred_memmap), p)
+                          for p in os.listdir(os.path.dirname(args.mordred_memmap)) if p.endswith("_kept_stats.npz")]
+            if not candidates:
+                raise FileNotFoundError("Could not find *_kept_stats.npz next to Mordred memmap.")
+            kept_stats = candidates[0]
+        Z = np.load(kept_stats, allow_pickle=True)
+        md_names = list(Z["names"])
+        md_mean = Z["mean"].astype(np.float64)
+        md_std  = Z["std"].astype(np.float64)
+
+        set_num_threads(args.ncpus)
+        model, tr_hist, va_hist = train_from_memmaps(
+            fp_memmap=args.fp_memmap, mordred_memmap=args.mordred_memmap, nrows=args.nrows,
+            fp_bits=args.fp_bits, mordred_dim=len(md_names), outdir=args.outdir,
+            latent_dim=args.latent_dim, epochs=args.epochs, batch_size=args.batch_size,
+            ncpus=args.ncpus, chunk_rows=args.chunk_rows, num_workers=args.num_workers, val_sample=100_000
+        )
+
+        # Save artifacts
+        save_artifacts(
+            outdir=args.outdir, fp_bits=args.fp_bits, mordred_names=md_names,
+            desc_mean=md_mean, desc_std=md_std, latent_dim=args.latent_dim, fp_radius=args.fp_radius
+        )
+        print(f"[train] Done. Artifacts in {args.outdir}")
+
+if __name__ == "__main__":
+    main()
+
