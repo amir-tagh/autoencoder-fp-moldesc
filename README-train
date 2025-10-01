@@ -1,0 +1,194 @@
+Dual-Head Autoencoder with Fingerprints + Mordred Descriptors
+
+This repository provides a stable dual-head autoencoder for large-scale SMILES corpora. It jointly reconstructs:
+
+Morgan fingerprints (binary, via BCE with pos-weights)
+
+Mordred descriptors (continuous, via MSE or Huber loss)
+
+The script is designed for tens of millions of molecules, using memory-mapped arrays (memmaps) and efficient chunked training. It includes robust training schedules and rich evaluation tools (t-SNE, clustering, per-feature error analysis).
+
+Key Features
+
+Dual-head architecture
+
+Fingerprint head with BCEWithLogitsLoss and automatic pos_weight calculation
+
+Mordred head with MSE or Huber loss
+
+Training stability
+
+Learning-rate warm-up + cosine decay
+
+Weight decay & gradient clipping
+
+Epoch-wise LR logging and plotting
+
+Evaluation & clustering
+
+Per-sample MSE and fingerprint Tanimoto scores
+
+Histograms, CDFs, feature error bar plots
+
+PCA & t-SNE projections of latent space
+
+Clustering with k-means, DBSCAN, or HDBSCAN
+
+Cluster statistics and per-cluster error boxplots
+
+Latent dimension tuning
+
+Grid search with Pareto-style cutoff
+
+Plots validation loss vs latent size
+
+Saves latent_tuning_results.csv and plots
+
+Installation
+
+Requirements:
+
+Python ≥ 3.8
+
+RDKit
+
+Mordred
+
+PyTorch
+
+NumPy, Pandas, scikit-learn, joblib
+
+Matplotlib, tqdm
+
+Optional: hdbscan for advanced clustering
+
+Install via conda:
+
+conda create -n ae python=3.9
+conda activate ae
+conda install -c conda-forge rdkit mordred
+pip install torch scikit-learn joblib pandas matplotlib tqdm hdbscan
+
+Usage
+
+The script exposes two commands: train and tune.
+
+1. Train model
+python ae_memmap_fp_mordred_dualhead_tsne_cluster_V3_stable.py train \
+  --fp_memmap fp_22M.uint8 \
+  --mordred_memmap mordred_5M.f32 \
+  --nrows 5000000 \
+  --fp_bits 1024 \
+  --latent_dim 256 \
+  --epochs 40 \
+  --batch_size 4096 \
+  --chunk_rows 100000 \
+  --num_workers 8 --ncpus 32 \
+  --lambda_fp 0.7 --lambda_md 1.0 --use_huber \
+  --lr 3e-4 --weight_decay 1e-4 --grad_clip 1.0 \
+  --warmup_epochs 3 --eta_min 1e-5 \
+  --eval_tsne_n 100000 \
+  --cluster_method kmeans --cluster_k 50 \
+  --outdir AE_OUT
+
+Important arguments
+
+--fp_memmap, --mordred_memmap: paths to memmaps built previously
+
+--nrows: number of rows (must match the smaller memmap, e.g. 5M for Mordred)
+
+--lambda_fp, --lambda_md: relative weighting of FP vs Mordred losses
+
+--use_huber: switch Mordred loss to Huber (robust regression)
+
+--cluster_method: one of kmeans, dbscan, hdbscan
+
+Outputs in AE_OUT/
+
+autoencoder_model.pt – trained model
+
+training_loss_plot.png, lr_schedule_plot.png
+
+training_metrics.csv – per-epoch loss & LR
+
+recon_error_hist.png, recon_error_cdf.png
+
+fp_vs_mordred_mse.png, fp_freq_vs_error.png
+
+per_feature_mse_top*_barh.png
+
+mordred_top*_orig_vs_recon_hist.png
+
+latent_pca.png, latent_tsne.npy, latent_tsne_clusters.png
+
+tsne_clusters_per_sample.csv, cluster_stats.csv
+
+cluster_mse_boxplot.png
+
+val_per_sample_metrics.csv
+
+fp_mean_tanimoto.txt
+
+2. Tune latent dimension
+python ae_memmap_fp_mordred_dualhead_tsne_cluster_V3_stable.py tune \
+  --fp_memmap fp_22M.uint8 \
+  --mordred_memmap mordred_5M.f32 \
+  --nrows 5000000 \
+  --fp_bits 1024 \
+  --outdir AE_TUNE \
+  --latent_grid 64,128,256,512 \
+  --epochs_tune 8 \
+  --batch_size 4096 \
+  --ncpus 32
+
+Outputs in AE_TUNE/
+
+latent_tuning_results.csv – validation/train loss, params, runtime
+
+latent_tuning_plot.png – val loss vs latent dim (log scale)
+
+Recommended latent dimension printed at the end
+
+Example HPC Workflow
+
+Typical Slurm batch script:
+
+#!/usr/bin/env bash
+#SBATCH --job-name=ae_train
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=500G
+#SBATCH --time=48:00:00
+
+module load conda
+conda activate ae
+
+SCRATCH="${SLURM_TMPDIR:-/tmp}/ae_${SLURM_JOB_ID}"
+mkdir -p "$SCRATCH"
+
+# Stage inputs
+cp /shared/fp_22M.uint8* "$SCRATCH/"
+cp /shared/mordred_5M.f32* "$SCRATCH/"
+
+python ae_memmap_fp_mordred_dualhead_tsne_cluster_V3_stable.py train \
+  --fp_memmap "$SCRATCH/fp_22M.uint8" \
+  --mordred_memmap "$SCRATCH/mordred_5M.f32" \
+  --nrows 5000000 --fp_bits 1024 \
+  --latent_dim 256 --epochs 40 --batch_size 4096 \
+  --ncpus 64 --num_workers 8 \
+  --outdir "$SCRATCH/AE_OUT"
+
+rsync -avh "$SCRATCH/AE_OUT/" /shared/AE_OUT_z256/
+
+Notes
+
+Row alignment: Always use the smaller row count (usually Mordred’s 5M).
+
+Scaling: *_kept_stats.npz ensures Mordred descriptors are standardized consistently.
+
+Evaluation: Rich plotting suite enables insight into reconstruction errors and latent space structure.
+
+Clustering: KMeans is default; DBSCAN/HDBSCAN require tuning eps/min_cluster_size.
+
+License
+
+MIT License (adapt as needed).
